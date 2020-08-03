@@ -13,9 +13,8 @@
 
 #define spiltchar = " "
 #define AUDIO_BUFFER_MAX 512
-
+// 오디오 전송방식과 블루투스를 ble 방식으로 생각해보기
 BluetoothSerial SerialBT;
-// TaskHandle_t Task1;
 
 // audio section
 
@@ -101,7 +100,7 @@ void wifiscan(){
 
 bool wificonnect(){
   int wifi_num = wifi_info_arr[0].toInt();
-  pref_ssid = ssids_array[wifi_num].c_str();
+  pref_ssid = ssids_array[wifi_num].c_str(); // rtc메모리나, eeprom에 저장하는 방법 고안하기
   pref_pass = wifi_info_arr[1].c_str();
 
   WiFi.begin(pref_ssid, pref_pass);
