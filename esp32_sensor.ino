@@ -54,7 +54,7 @@ const uint8_t b_button_pin = 17; // bluetooth button
 const uint8_t p_button_pin = 34; // power button
 long b_button_timeout = 3000;
 long p_button_time = 3000;
-long chk_blue;
+long chk_time;
 bool chk_power_state = false;
 
 void split(String wifi_info){
@@ -74,7 +74,7 @@ void split(String wifi_info){
 
 void wifiscan(){
   WiFi.mode(WIFI_STA);
-  // WiFi.scanNetworks will return the number of networks found
+  
   int n =  WiFi.scanNetworks();
   if (n == 0) {
     SerialBT.println("no networks found");
@@ -118,22 +118,21 @@ bool wificonnect(){
 // audio section
 
 void IRAM_ATTR onTimer() {
-  portENTER_CRITICAL_ISR(&timerMux); // para rodar um código crítico sem ser interrompido.
-  int adcVal = adc1_get_voltage(ADC1_CHANNEL_4); // faz a leitura do ADC
-  if (adcVal > 3800){ //3500 sem gain em gnd
+  portENTER_CRITICAL_ISR(&timerMux);
+  int adcVal = adc1_get_voltage(ADC1_CHANNEL_4);
+  if (adcVal > 3800){
     adcVal = 4095;
   }
-  uint16_t value = map(adcVal, 0 , 4095, 0, 255);  // mapeamento para 8 bits
-  audioBuffer[bufferPointer] = value; // armazenamento do valor
+  uint16_t value = map(adcVal, 0 , 4095, 0, 255);
+  audioBuffer[bufferPointer] = value;
   bufferPointer++;
 
- // Ação no preenchimento do buffer
   if (bufferPointer == AUDIO_BUFFER_MAX) {
     bufferPointer = 0;
-    memcpy(transmitBuffer, audioBuffer, AUDIO_BUFFER_MAX); // transfere o buffer
-    transmitNow = true; // flag para envio do buffer
+    memcpy(transmitBuffer, audioBuffer, AUDIO_BUFFER_MAX);
+    transmitNow = true;
   }
-  portEXIT_CRITICAL_ISR(&timerMux); // prioridade no código crítico
+  portEXIT_CRITICAL_ISR(&timerMux);
 }
 
 // server connect section
@@ -275,13 +274,13 @@ void check_bluetooth_state(){
 void ledstate(){
   switch (led)
   {
-    case POWER_ON:
+    case POWER_ON: // led green
       digitalWrite(LED_BUILTIN, LOW);
       led = DONE;
       break;
-    case BLUETOOTH_ON:
-      chk_blue = millis();
-      while(millis() - chk_blue < 20000 && state != BLUETOOTH_CONNECTED){
+    case BLUETOOTH_ON: // led blue blink
+      chk_time = millis();
+      while(millis() - chk_time < 10000 && state != BLUETOOTH_CONNECTED){
         digitalWrite(LED_BUILTIN, LOW);
         delay(100);
         digitalWrite(LED_BUILTIN, HIGH);
@@ -291,11 +290,7 @@ void ledstate(){
       led = POWER_ON;
       ledstate();
       break;
-    case SERVER_CONNECTING:
-      digitalWrite(LED_BUILTIN, LOW);
-      delay(1000);
-      digitalWrite(LED_BUILTIN, HIGH);
-      delay(1000);
+    case SERVER_CONNECTING: // led green blink
       break;
     case LOW_BATTERY:
       break;
