@@ -4,6 +4,7 @@
 #include <esp_spp_api.h>
 #include <string.h>
 #include <driver/adc.h>
+#include <Adafruit_NeoPixel.h>
 
 // arduino ide, install esp32 https://github.com/espressif/arduino-esp32
 
@@ -13,7 +14,7 @@
 
 #define spiltchar = " "
 #define AUDIO_BUFFER_MAX 512
-// 오디오 전송방식과 블루투스를 ble 방식으로 생각해보기
+
 BluetoothSerial SerialBT;
 
 // audio section
@@ -21,7 +22,7 @@ BluetoothSerial SerialBT;
 uint8_t audioBuffer[AUDIO_BUFFER_MAX];
 uint8_t transmitBuffer[AUDIO_BUFFER_MAX];
 uint32_t bufferPointer = 0;
-const char* serverhost = ""; // 서버 주소
+const char* serverhost = "192.168.0.13"; // 서버 주소
 const int port = 8888;
 bool transmitNow = false;
 
@@ -32,10 +33,13 @@ portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // bluetooth wifi connect section
 
+RTC_DATA_ATTR bool is_get_wifi = false;
+RTC_DATA_ATTR String get_ssid = "";
+RTC_DATA_ATTR String get_password = "";
 bool bluetooth_disconnect = false;
-enum LED_state {POWER_ON, BLUETOOTH_ON, SERVER_CONNECTING, LOW_BATTERY, DONE};
+enum LED_state {POWER_ON, BLUETOOTH_ON, SERVER_CONNECTING, SERVER_CON_FAILED, LOW_BATTERY, DONE};
 enum Setup_state { NONE, POWER_CHECK, BLUETOOTH_CHECK, BLUETOOTH_MODE, BLUETOOTH_CONNECTED, 
-        WIFI_SCAN, SCAN_COMPLETE, WIFI_CONNECT, CONNECT_FAILED, WIFI_CONNECTED, SERVER_CONNECTED};
+        WIFI_SCAN, SCAN_COMPLETE, WIFI_CONNECT, CONNECT_FAILED, WIFI_CONNECTED, SERVER_CONNECTED, SERVER_CONNECT_FAILED};
 enum LED_state led = POWER_ON;
 enum Setup_state state = NONE;
 String network_string;
@@ -44,18 +48,27 @@ String wifi_ssid;
 String wifi_password;
 String wifi_info_arr[2];
 String chk_scan = "scan";
-long wifi_timeout = 10000;
+long wifi_timeout = 5000;
 const char* pref_ssid = "";
 const char* pref_pass = "";
 
 // button section
 
-const uint8_t b_button_pin = 17; // bluetooth button
-const uint8_t p_button_pin = 34; // power button
+const uint8_t b_button_pin = 27; // bluetooth button
+const uint8_t p_button_pin = 25; // power button
 long b_button_timeout = 3000;
 long p_button_time = 3000;
 long chk_time;
 bool chk_power_state = false;
+
+const uint8_t battery_check_pin = 33;
+
+// NeoPixel LED
+#define LED_PIN 12
+#define LED_COUNT 1
+#define BRIGHTNESS 50
+
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 
 void split(String wifi_info){
   char *token;
@@ -79,9 +92,6 @@ void wifiscan(){
   if (n == 0) {
     SerialBT.println("no networks found");
   } else {
-    SerialBT.println();
-    SerialBT.print(n);
-    SerialBT.println(" networks found");
     delay(1000);
     for (int i = 0; i < n; ++i) {
       ssids_array[i + 1] = WiFi.SSID(i);
@@ -92,26 +102,43 @@ void wifiscan(){
       network_string = network_string + ": " + WiFi.SSID(i) + " (Strength:" + WiFi.RSSI(i) + ")";
       SerialBT.println(network_string);
     }
-    SerialBT.println("enter ssid and password");
-    Serial.println("enter ssid and password");
   }
   state = SCAN_COMPLETE;
 }
 
 bool wificonnect(){
   int wifi_num = wifi_info_arr[0].toInt();
-  pref_ssid = ssids_array[wifi_num].c_str(); // rtc메모리나, eeprom에 저장하는 방법 고안하기
-  pref_pass = wifi_info_arr[1].c_str();
+  if(is_get_wifi){
+    pref_ssid = get_ssid.c_str();
+    pref_pass = get_password.c_str();
+  }else{
+    get_ssid = ssids_array[wifi_num];
+    get_password = wifi_info_arr[1];
+    pref_ssid = ssids_array[wifi_num].c_str(); // rtc or eeprom
+    pref_pass = wifi_info_arr[1].c_str();
+  }
 
   WiFi.begin(pref_ssid, pref_pass);
   long start_wifi_connect = millis();
   while (WiFi.status() != WL_CONNECTED){
     delay(500);
+    strip.setPixelColor(0, 0, 0, 200);
+    strip.show();
+    delay(100);
+    strip.setPixelColor(0, 0, 0, 0);
+    strip.show();
+    delay(100);
     if(millis() - start_wifi_connect > wifi_timeout){
+      is_get_wifi = false;
       WiFi.disconnect(true, true);
+      strip.setPixelColor(0, 200, 100, 0);
+      strip.show();
       return false;
     }
   }
+  is_get_wifi = true;
+  led = POWER_ON;
+  ledstate();
   return true;
 }
 
@@ -123,7 +150,7 @@ void IRAM_ATTR onTimer() {
   if (adcVal > 3800){
     adcVal = 4095;
   }
-  uint16_t value = map(adcVal, 0 , 4095, 0, 255);
+  uint8_t value = map(adcVal, 0 , 4095, 0, 255);
   audioBuffer[bufferPointer] = value;
   bufferPointer++;
 
@@ -141,33 +168,34 @@ void serverConnect(){
   adc1_config_width(ADC_WIDTH_12Bit);
   adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_11db);
 
-  while (!client.connect(serverhost, port)){
+  if (!client.connect(serverhost, port)){
     Serial.println("server connection failed"); // 서버연결 확인용
-    delay(1000);
+    state = SERVER_CONNECT_FAILED;
+    led = SERVER_CON_FAILED;
+  }else {
+    state = SERVER_CONNECTED;
+    led = POWER_ON;
+
+    Serial.println("connected to server"); //서버연결 확인용
+
+    timer = timerBegin(0, 80, true);
+    timerAttachInterrupt(timer, &onTimer, true);
+    timerAlarmWrite(timer, 125, true);
+    timerAlarmEnable(timer);
   }
-
-  state = SERVER_CONNECTED;
-  led = POWER_ON;
-
-  Serial.println("connected to server"); //서버연결 확인용
-
-  timer = timerBegin(0, 80, true);
-  timerAttachInterrupt(timer, &onTimer, true);
-  timerAlarmWrite(timer, 125, true);
-  timerAlarmEnable(timer);
 }
 
 // bluetooth and device callback section
 
 void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
-  if(event == ESP_SPP_SRV_OPEN_EVT){
+  if(event == ESP_SPP_SRV_OPEN_EVT && state == BLUETOOTH_MODE){
     Serial.println("Device Connected"); // 연결확인용
-    SerialBT.println("if you want wifi scan enter (scan)");
     state = BLUETOOTH_CONNECTED;
   }
 
   if(event == ESP_SPP_DATA_IND_EVT && state == BLUETOOTH_CONNECTED){
     String chk_s = SerialBT.readString();
+    chk_s.trim();
     if(chk_s == chk_scan){
       Serial.println("wifi-scan start");
       state = WIFI_SCAN;
@@ -196,20 +224,17 @@ void callback_show_ip(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 // bluetooth section
 
 void bluetooth_Setup(){
-  SerialBT.begin("esp32 test");
+  SerialBT.begin("HermesSensor");
   ledstate();
 }
 
 void disconnect_bluetooth(){
   delay(1000);
   Serial.println("BT stopping");
-  SerialBT.println("Bluetooth disconnecting...");
-  delay(1000);
   SerialBT.flush();
   SerialBT.disconnect();
   SerialBT.end();
   Serial.println("BT stopped");
-  delay(1000);
   bluetooth_disconnect = false;
 }
 
@@ -234,13 +259,13 @@ void check_power_state(){
     Serial.println("power on"); // 전원 확인용
     led = POWER_ON;
     ledstate();
-    state = NONE;
   }else{
-    digitalWrite(LED_BUILTIN, HIGH);
     Serial.println("power OFF");
     Serial.println("Going to sleep now");
     detachInterrupt(p_button_pin);
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 1);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_25, 1);
+    strip.setPixelColor(0, 0, 0, 0);
+    strip.show();
     esp_deep_sleep_start();
   }
 }
@@ -275,15 +300,18 @@ void ledstate(){
   switch (led)
   {
     case POWER_ON: // led green
-      digitalWrite(LED_BUILTIN, LOW);
+      strip.setPixelColor(0, 0, 200, 0);
+      strip.show();
       led = DONE;
       break;
     case BLUETOOTH_ON: // led blue blink
       chk_time = millis();
       while(millis() - chk_time < 10000 && state != BLUETOOTH_CONNECTED){
-        digitalWrite(LED_BUILTIN, LOW);
+        strip.setPixelColor(0, 0, 0, 200);
+        strip.show();
         delay(100);
-        digitalWrite(LED_BUILTIN, HIGH);
+        strip.setPixelColor(0, 0, 0, 0);
+        strip.show();
         delay(100);
       }
       check_bluetooth_state();
@@ -292,9 +320,17 @@ void ledstate(){
       break;
     case SERVER_CONNECTING: // led green blink
       break;
+    case SERVER_CON_FAILED:
+      strip.setPixelColor(0, 200, 0, 100);
+      strip.show();
+      break;
     case LOW_BATTERY:
+      strip.setPixelColor(0, 200, 0, 0);
+      strip.show();
       break;
     case DONE:
+      strip.setPixelColor(0, 0, 0, 0);
+      strip.show();
       break;
   }
 }
@@ -304,20 +340,13 @@ void ledstate(){
 void setup() {
   Serial.begin(115200);
 
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
+  strip.begin();
+  strip.setBrightness(BRIGHTNESS);
   pinMode(b_button_pin, INPUT_PULLUP);
   pinMode(p_button_pin, INPUT_PULLDOWN);
   attachInterrupt(b_button_pin, b_button_isr, FALLING);
-  attachInterrupt(p_button_pin, p_button_isr, RISING)
-
-  if(!wificonnect()){
-    SerialBT.register_callback(callback);
-  } else{
-    SerialBT.register_callback(callback_show_ip);
-    state = WIFI_CONNECTED;
-    led = POWER_ON;
-  }
+  attachInterrupt(p_button_pin, p_button_isr, RISING);
+  SerialBT.register_callback(callback);
 }
 
 // main loop
@@ -331,6 +360,11 @@ void loop() {
     case POWER_CHECK:
       check_power();
       check_power_state();
+      if(is_get_wifi){
+        state = WIFI_CONNECT;
+      }else{
+        state = NONE;
+      }
       break;
     case BLUETOOTH_CHECK:
       chk_bluetooth();
@@ -341,7 +375,6 @@ void loop() {
       break;
 
     case WIFI_SCAN:
-      SerialBT.println("Scanning Wi-Fi networks");
       Serial.println("Scanning Wi-Fi networks");
       wifiscan();
       break;
@@ -360,10 +393,12 @@ void loop() {
       break;
     
     case CONNECT_FAILED:
-      SerialBT.println("Wi-Fi connection failed");
       Serial.println("Wi-Fi connection failed");
-      delay(2000);
-      state = WIFI_SCAN;
+      state = NONE;
+      break;
+
+    case SERVER_CONNECT_FAILED:
+      ledstate();
       break;
     
     case SERVER_CONNECTED:
