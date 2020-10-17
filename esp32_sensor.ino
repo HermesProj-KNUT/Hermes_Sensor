@@ -34,8 +34,8 @@ portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 // bluetooth wifi connect section
 
 RTC_DATA_ATTR bool is_get_wifi = false;
-RTC_DATA_ATTR String get_ssid = "";
-RTC_DATA_ATTR String get_password = "";
+RTC_DATA_ATTR char get_ssid[10];
+RTC_DATA_ATTR char get_password[20];
 bool bluetooth_disconnect = false;
 enum LED_state {POWER_ON, BLUETOOTH_ON, SERVER_CONNECTING, SERVER_CON_FAILED, LOW_BATTERY, DONE};
 enum Setup_state { NONE, POWER_CHECK, BLUETOOTH_CHECK, BLUETOOTH_MODE, BLUETOOTH_CONNECTED, 
@@ -109,11 +109,11 @@ void wifiscan(){
 bool wificonnect(){
   int wifi_num = wifi_info_arr[0].toInt();
   if(is_get_wifi){
-    pref_ssid = get_ssid.c_str();
-    pref_pass = get_password.c_str();
+    pref_ssid = get_ssid;
+    pref_pass = get_password;
   }else{
-    get_ssid = ssids_array[wifi_num];
-    get_password = wifi_info_arr[1];
+    strcpy(get_ssid, ssids_array[wifi_num].c_str());
+    strcpy(get_password, wifi_info_arr[1].c_str());
     pref_ssid = ssids_array[wifi_num].c_str(); // rtc or eeprom
     pref_pass = wifi_info_arr[1].c_str();
   }
@@ -207,17 +207,6 @@ void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
     wifi_info.trim();
     split(wifi_info);
     state = WIFI_CONNECT;
-  }
-}
-
-void callback_show_ip(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
-{
-  if (event == ESP_SPP_SRV_OPEN_EVT) {
-    SerialBT.print("ESP32 IP: ");
-    SerialBT.println(WiFi.localIP());
-    Serial.print("ESP32 IP: ");
-    Serial.println(WiFi.localIP());
-    bluetooth_disconnect = true;
   }
 }
 
