@@ -1,10 +1,11 @@
 #include <Arduino.h>
-#include "WiFi.h"
+#include <WiFi.h>
 #include "BluetoothSerial.h"
 #include <esp_spp_api.h>
 #include <string.h>
 #include <driver/adc.h>
 #include <Adafruit_NeoPixel.h>
+#include <HTTPClient.h> // 추가
 
 // arduino ide, install esp32 https://github.com/espressif/arduino-esp32
 
@@ -13,20 +14,19 @@
 #endif
 
 #define spiltchar = " "
-#define AUDIO_BUFFER_MAX 512
+#define audio_buf 8000
+#define recordcount 10
+uint8_t audioflag = 0;
 
 BluetoothSerial SerialBT;
+HTTPClient http;
 
 // audio section
-
-uint8_t audioBuffer[AUDIO_BUFFER_MAX];
-uint8_t transmitBuffer[AUDIO_BUFFER_MAX];
+uint8_t audioBuffer[audio_buf];
+uint8_t transbuffer[audio_buf];
 uint32_t bufferPointer = 0;
-const char* serverhost = "192.168.0.13"; // 서버 주소
-const int port = 8888;
+#define serverhost "http://34.64.147.110:80/" // 서버 주소
 bool transmitNow = false;
-
-WiFiClient client;
 
 hw_timer_t * timer = NULL;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
@@ -37,31 +37,28 @@ RTC_DATA_ATTR bool is_get_wifi = false;
 RTC_DATA_ATTR char get_ssid[10];
 RTC_DATA_ATTR char get_password[20];
 bool bluetooth_disconnect = false;
-enum LED_state {POWER_ON, BLUETOOTH_ON, SERVER_CONNECTING, SERVER_CON_FAILED, LOW_BATTERY, DONE};
 enum Setup_state { NONE, POWER_CHECK, BLUETOOTH_CHECK, BLUETOOTH_MODE, BLUETOOTH_CONNECTED, 
-        WIFI_SCAN, SCAN_COMPLETE, WIFI_CONNECT, CONNECT_FAILED, WIFI_CONNECTED, SERVER_CONNECTED, SERVER_CONNECT_FAILED};
-enum LED_state led = POWER_ON;
+        WIFI_SCAN, SCAN_COMPLETE, WIFI_CONNECT, WIFI_CONNECTED, SETUP_MIC, SERVER_ERROR};
 enum Setup_state state = NONE;
+enum SetLED {GREEN, BLUE, RED, PURPLE, OFF};
+enum SetLED led_state = OFF;
 String network_string;
-String ssids_array[50];
-String wifi_ssid;
-String wifi_password;
+String ssids_array[30];
 String wifi_info_arr[2];
-String chk_scan = "scan";
-long wifi_timeout = 5000;
+#define chk_scan "scan"
 const char* pref_ssid = "";
 const char* pref_pass = "";
 
 // button section
 
-const uint8_t b_button_pin = 27; // bluetooth button
-const uint8_t p_button_pin = 25; // power button
-long b_button_timeout = 3000;
-long p_button_time = 3000;
+#define b_button_pin 27 // bluetooth button
+#define p_button_pin 25 // power button
+#define button_time 3000
 long chk_time;
 bool chk_power_state = false;
+bool chk_ble = false;
 
-const uint8_t battery_check_pin = 33;
+#define battery_check_pin 33;
 
 // NeoPixel LED
 #define LED_PIN 12
@@ -95,9 +92,6 @@ void wifiscan(){
     delay(1000);
     for (int i = 0; i < n; ++i) {
       ssids_array[i + 1] = WiFi.SSID(i);
-      Serial.print(i + 1);
-      Serial.print(": ");
-      Serial.println(ssids_array[i + 1]);
       network_string = i + 1;
       network_string = network_string + ": " + WiFi.SSID(i) + " (Strength:" + WiFi.RSSI(i) + ")";
       SerialBT.println(network_string);
@@ -111,12 +105,16 @@ bool wificonnect(){
   if(is_get_wifi){
     pref_ssid = get_ssid;
     pref_pass = get_password;
+    bluetooth_disconnect = false;
   }else{
     strcpy(get_ssid, ssids_array[wifi_num].c_str());
     strcpy(get_password, wifi_info_arr[1].c_str());
     pref_ssid = ssids_array[wifi_num].c_str(); // rtc or eeprom
     pref_pass = wifi_info_arr[1].c_str();
+    bluetooth_disconnect = true;
   }
+  Serial.println(pref_ssid);
+  Serial.println(pref_pass);
 
   WiFi.begin(pref_ssid, pref_pass);
   long start_wifi_connect = millis();
@@ -128,7 +126,7 @@ bool wificonnect(){
     strip.setPixelColor(0, 0, 0, 0);
     strip.show();
     delay(100);
-    if(millis() - start_wifi_connect > wifi_timeout){
+    if(millis() - start_wifi_connect > 5000){
       is_get_wifi = false;
       WiFi.disconnect(true, true);
       strip.setPixelColor(0, 200, 100, 0);
@@ -137,7 +135,7 @@ bool wificonnect(){
     }
   }
   is_get_wifi = true;
-  led = POWER_ON;
+  led_state = GREEN;
   ledstate();
   return true;
 }
@@ -147,16 +145,16 @@ bool wificonnect(){
 void IRAM_ATTR onTimer() {
   portENTER_CRITICAL_ISR(&timerMux);
   int adcVal = adc1_get_voltage(ADC1_CHANNEL_4);
-  if (adcVal > 3800){
+  /*if (adcVal > 3800){
     adcVal = 4095;
-  }
+  }*/
   uint8_t value = map(adcVal, 0 , 4095, 0, 255);
   audioBuffer[bufferPointer] = value;
   bufferPointer++;
 
-  if (bufferPointer == AUDIO_BUFFER_MAX) {
+  if (bufferPointer == audio_buf) {
     bufferPointer = 0;
-    memcpy(transmitBuffer, audioBuffer, AUDIO_BUFFER_MAX);
+    memcpy(transbuffer, audioBuffer, audio_buf);
     transmitNow = true;
   }
   portEXIT_CRITICAL_ISR(&timerMux);
@@ -164,24 +162,24 @@ void IRAM_ATTR onTimer() {
 
 // server connect section
 
-void serverConnect(){
+void setMic(){
   adc1_config_width(ADC_WIDTH_12Bit);
   adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_11db);
 
-  if (!client.connect(serverhost, port)){
-    Serial.println("server connection failed"); // 서버연결 확인용
-    state = SERVER_CONNECT_FAILED;
-    led = SERVER_CON_FAILED;
-  }else {
-    state = SERVER_CONNECTED;
-    led = POWER_ON;
+  http.begin(serverhost);
+  int response = http.GET();
 
-    Serial.println("connected to server"); //서버연결 확인용
+  if(response > 0){
+    state = SETUP_MIC;
 
-    timer = timerBegin(0, 80, true);
+    timer = timerBegin(0, 8, true);
     timerAttachInterrupt(timer, &onTimer, true);
-    timerAlarmWrite(timer, 125, true);
+    timerAlarmWrite(timer, 625, true);
     timerAlarmEnable(timer);
+  }else{
+    state = SERVER_ERROR;
+    led_state = PURPLE;
+    ledstate();
   }
 }
 
@@ -189,11 +187,13 @@ void serverConnect(){
 
 void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
   if(event == ESP_SPP_SRV_OPEN_EVT && state == BLUETOOTH_MODE){
-    Serial.println("Device Connected"); // 연결확인용
     state = BLUETOOTH_CONNECTED;
+    chk_ble = false;
   }
 
   if(event == ESP_SPP_DATA_IND_EVT && state == BLUETOOTH_CONNECTED){
+    led_state = GREEN;
+    ledstate();
     String chk_s = SerialBT.readString();
     chk_s.trim();
     if(chk_s == chk_scan){
@@ -207,6 +207,7 @@ void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
     wifi_info.trim();
     split(wifi_info);
     state = WIFI_CONNECT;
+    is_get_wifi = false;
   }
 }
 
@@ -214,16 +215,31 @@ void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
 
 void bluetooth_Setup(){
   SerialBT.begin("HermesSensor");
+  chk_ble = true;
+  chk_time = millis();
+  while(millis() - chk_time < 15000 && state != BLUETOOTH_CONNECTED){
+    strip.setPixelColor(0, 0, 0, 200);
+    strip.show();
+    delay(100);
+    strip.setPixelColor(0, 0, 0, 0);
+    strip.show();
+    delay(100);
+  }
+  led_state = GREEN;
   ledstate();
+  if (chk_ble){
+    SerialBT.end();
+    state = NONE;
+    led_state = BLUE;
+    ledstate();
+  }
 }
 
 void disconnect_bluetooth(){
   delay(1000);
-  Serial.println("BT stopping");
   SerialBT.flush();
   SerialBT.disconnect();
   SerialBT.end();
-  Serial.println("BT stopped");
   bluetooth_disconnect = false;
 }
 
@@ -235,8 +251,9 @@ void IRAM_ATTR p_button_isr(){
 
 void check_power(){
   long chk_p_button = millis();
+  delayMicroseconds(5000);
   while(digitalRead(p_button_pin) == HIGH){
-    if(millis() - chk_p_button >= 3000){
+    if(millis() - chk_p_button >= button_time){
       chk_power_state = !chk_power_state;
       break;
     }
@@ -246,15 +263,15 @@ void check_power(){
 void check_power_state(){
   if(chk_power_state){
     Serial.println("power on"); // 전원 확인용
-    led = POWER_ON;
+    led_state = GREEN;
     ledstate();
   }else{
+    led_state = OFF;
+    ledstate();
     Serial.println("power OFF");
     Serial.println("Going to sleep now");
     detachInterrupt(p_button_pin);
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_25, 1);
-    strip.setPixelColor(0, 0, 0, 0);
-    strip.show();
     esp_deep_sleep_start();
   }
 }
@@ -268,56 +285,43 @@ void IRAM_ATTR b_button_isr(){
 void chk_bluetooth(){
   long chk_b_button = millis();
   while(digitalRead(b_button_pin) == LOW && state != BLUETOOTH_MODE){
-    if(millis() - chk_b_button >= b_button_timeout){
-      led = BLUETOOTH_ON;
+    if(millis() - chk_b_button >= button_time){
       state = BLUETOOTH_MODE;
     }
   }
 }
 
-void check_bluetooth_state(){
-  if(state != BLUETOOTH_CONNECTED){
-    Serial.println("cannot find device");
-    SerialBT.end();
-    state = NONE;
+bool chLED(){
+  int getResponse = http.GET();
+  if(http.getString() == "led"){
+    return true;
+  }else{
+    return false;
   }
 }
 
 // LED state
 
 void ledstate(){
-  switch (led)
+  switch (led_state)
   {
-    case POWER_ON: // led green
+    case GREEN: // led green
       strip.setPixelColor(0, 0, 200, 0);
       strip.show();
-      led = DONE;
       break;
-    case BLUETOOTH_ON: // led blue blink
-      chk_time = millis();
-      while(millis() - chk_time < 10000 && state != BLUETOOTH_CONNECTED){
-        strip.setPixelColor(0, 0, 0, 200);
-        strip.show();
-        delay(100);
-        strip.setPixelColor(0, 0, 0, 0);
-        strip.show();
-        delay(100);
-      }
-      check_bluetooth_state();
-      led = POWER_ON;
-      ledstate();
-      break;
-    case SERVER_CONNECTING: // led green blink
-      break;
-    case SERVER_CON_FAILED:
-      strip.setPixelColor(0, 200, 0, 100);
+    case BLUE: // led blue blink
+      strip.setPixelColor(0, 0, 0, 200);
       strip.show();
       break;
-    case LOW_BATTERY:
+    case PURPLE:
+      strip.setPixelColor(0, 200, 0, 150);
+      strip.show();
+      break;
+    case RED:
       strip.setPixelColor(0, 200, 0, 0);
       strip.show();
       break;
-    case DONE:
+    case OFF:
       strip.setPixelColor(0, 0, 0, 0);
       strip.show();
       break;
@@ -341,9 +345,6 @@ void setup() {
 // main loop
 
 void loop() {
-  if(bluetooth_disconnect){
-    disconnect_bluetooth();
-  }
   switch (state)
   {
     case POWER_CHECK:
@@ -364,37 +365,48 @@ void loop() {
       break;
 
     case WIFI_SCAN:
-      Serial.println("Scanning Wi-Fi networks");
       wifiscan();
       break;
 
     case WIFI_CONNECT:
       if(wificonnect()){
-        String connectIP = "IP : " + WiFi.localIP().toString();
-        SerialBT.println(connectIP);
-        Serial.println(connectIP);
         state = WIFI_CONNECTED;
-        bluetooth_disconnect = true;
-        serverConnect();
+        if(bluetooth_disconnect){
+          disconnect_bluetooth();
+        }
+        setMic();
       }else{
-        state = CONNECT_FAILED;
+        Serial.println("Wi-Fi connection failed");
+        state = NONE;
       }
       break;
     
-    case CONNECT_FAILED:
-      Serial.println("Wi-Fi connection failed");
-      state = NONE;
-      break;
-
-    case SERVER_CONNECT_FAILED:
-      ledstate();
-      break;
-    
-    case SERVER_CONNECTED:
+    case SETUP_MIC:
       if(transmitNow){
         transmitNow = false;
-        client.write((const uint8_t *)audioBuffer, sizeof(audioBuffer));
+        int httpResponseCode = http.POST((uint8_t *)transbuffer, sizeof(transbuffer));
+        audioflag++;
+        if (audioflag == recordcount){
+          audioflag = 0;
+          bufferPointer = 0;
+          timerStop(timer);
+          delay(5000);
+          while(chLED()){
+            led_state = GREEN;
+            ledstate();
+            delay(1000);
+            led_state = OFF;
+            ledstate();
+            delay(1000);
+          }
+          led_state = GREEN;
+          ledstate();
+          timerStart(timer);
+        }
       }
+      break;
+    
+    case SERVER_ERROR:
       break;
   }
 }
